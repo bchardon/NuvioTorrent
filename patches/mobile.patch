@@ -585,10 +585,10 @@ index 0000000..85fb1bc
 +}
 diff --git a/composeApp/src/androidHostTest/kotlin/com/nuvio/app/features/p2p/TorrentMetadataTest.kt b/composeApp/src/androidHostTest/kotlin/com/nuvio/app/features/p2p/TorrentMetadataTest.kt
 new file mode 100644
-index 0000000..a0a5914
+index 0000000..9b969e3
 --- /dev/null
 +++ b/composeApp/src/androidHostTest/kotlin/com/nuvio/app/features/p2p/TorrentMetadataTest.kt
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,122 @@
 +package com.nuvio.app.features.p2p
 +
 +import java.util.Base64
@@ -643,9 +643,18 @@ index 0000000..a0a5914
 +        MockWebServer().use { server ->
 +            server.enqueue(MockResponse().setResponseCode(403).setBody("token=secret"))
 +            val error = expectSourceError { TorrentMetadataLoader.load(TorrentSource(url = server.url("/secret").toString())) }
-+            assertTrue(error.message!!.contains("authentication"))
-+            assertFalse(error.toString().contains("secret"))
-+            assertNull(error.cause)
++            assertTrue("Expected an authentication error, got: ${error.message}", error.message!!.contains("authentication"))
++            // Coroutine stack-trace recovery may attach the original safe exception as a cause.
++            // Check the full diagnostic output, including causes, rather than requiring no cause.
++            assertFalse("Authentication diagnostics must not expose request or response data",
++                error.stackTraceToString().contains("secret"))
++            var current: Throwable? = error
++            repeat(32) {
++                val cause = current ?: return@repeat
++                assertTrue("Only sanitized torrent errors may be retained as causes", cause is TorrentSourceException)
++                current = cause.cause
++            }
++            assertNull("Unexpected cyclic or excessive exception chain", current)
 +        }
 +    }
 +
