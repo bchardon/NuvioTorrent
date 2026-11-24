@@ -53,6 +53,9 @@ jobs:
           node-version: '22'
       - uses: gradle/actions/setup-gradle@v4
       - uses: android-actions/setup-android@v3
+        with:
+          # The legacy "tools" package is no longer distributed by Google.
+          packages: platform-tools
       - name: Test JavaScript resolver contract
         run: node scripts/test-contract.js '${{ matrix.platform }}' 'work/${{ matrix.platform }}'
       - name: Prepare runtime properties
