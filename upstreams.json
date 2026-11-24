@@ -1,0 +1,12 @@
+{
+  "tv": {
+    "repository": "NuvioMedia/NuvioTV",
+    "commit": "77cc0bb5f42f55c5e3877fc4d57a7df510c3f42b",
+    "directory": "NuvioTV"
+  },
+  "mobile": {
+    "repository": "NuvioMedia/NuvioMobile",
+    "commit": "0d20af832d381e5ab3a385deccfbc47c12b93bf1",
+    "directory": "NuvioMobile"
+  }
+}

@@ -1,0 +1,990 @@
+diff --git a/app/src/full/java/com/nuvio/tv/core/plugin/PluginRuntime.kt b/app/src/full/java/com/nuvio/tv/core/plugin/PluginRuntime.kt
+index 7c9c204..47c54f6 100644
+--- a/app/src/full/java/com/nuvio/tv/core/plugin/PluginRuntime.kt
++++ b/app/src/full/java/com/nuvio/tv/core/plugin/PluginRuntime.kt
+@@ -1,6 +1,9 @@
+ package com.nuvio.tv.core.plugin
+ 
+ import android.util.Log
++import com.nuvio.tv.core.torrent.TorrentSource
++import com.nuvio.tv.core.torrent.TorrentSources
++import com.nuvio.tv.core.torrent.TorrentSourceException
+ import com.dokar.quickjs.binding.define
+ import com.dokar.quickjs.binding.function
+ import com.dokar.quickjs.quickJs
+@@ -41,7 +44,7 @@ import javax.inject.Singleton
+ 
+ private const val TAG = "PluginRuntime"
+ private const val PLUGIN_TIMEOUT_MS = 60_000L
+-private const val MAX_FETCH_RESPONSE_BYTES = 1024 * 1024
++private const val MAX_FETCH_RESPONSE_BYTES = 4 * 1024 * 1024
+ private const val MAX_FETCH_BODY_CHARS = 1024 * 1024
+ @Singleton
+ class PluginRuntime @Inject constructor() {
+@@ -132,6 +135,18 @@ class PluginRuntime @Inject constructor() {
+     private fun getStaticCallCode(): String {
+         return """
+             (async function() {
++                var torrentArgs = JSON.parse(__get_call_args());
++                if (torrentArgs.torrentResolveId != null) {
++                    try {
++                        var resolver = module.exports.resolveTorrent || globalThis.resolveTorrent;
++                        if (typeof resolver !== 'function') throw new Error('Missing torrent resolver');
++                        var resolved = await resolver(torrentArgs.torrentResolveId);
++                        __capture_result(JSON.stringify(resolved || {}));
++                    } catch (_) {
++                        __capture_result(JSON.stringify({error: 'TORRENT_RESOLUTION_FAILED'}));
++                    }
++                    return;
++                }
+                 try {
+                     var getStreams = module.exports.getStreams || globalThis.getStreams;
+                     if (!getStreams) {
+@@ -223,7 +238,13 @@ class PluginRuntime @Inject constructor() {
+         scraperId: String,
+         scraperSettings: Map<String, Any> = emptyMap()
+     ): List<LocalScraperResult> = withTimeout(PLUGIN_TIMEOUT_MS) {
+-        executePluginInternal(code, tmdbId, mediaType, season, episode, scraperId, scraperSettings)
++        parseJsonResults(executePluginInternal(code, tmdbId, mediaType, season, episode, scraperId, scraperSettings)) { id ->
++            withTimeout(PLUGIN_TIMEOUT_MS) {
++                val raw = executePluginInternal(code, tmdbId, mediaType, season, episode, scraperId, scraperSettings, id)
++                val value = gson.fromJson(raw, Map::class.java)
++                parseTorrentSource(value) ?: throw TorrentSourceException("The plugin did not return torrent metadata")
++            }
++        }
+     }
+ 
+     private suspend fun executePluginInternal(
+@@ -233,8 +254,9 @@ class PluginRuntime @Inject constructor() {
+         season: Int?,
+         episode: Int?,
+         scraperId: String,
+-        scraperSettings: Map<String, Any>
+-    ): List<LocalScraperResult> {
++        scraperSettings: Map<String, Any>,
++        torrentResolveId: String? = null
++    ): String {
+         val documentCache = ConcurrentHashMap<String, Document>()
+         val loadedDocIds = java.util.Collections.synchronizedList(mutableListOf<String>())
+         val elementCache = ConcurrentHashMap<String, Element>()
+@@ -265,23 +287,23 @@ class PluginRuntime @Inject constructor() {
+                 // Define console object - must return null to avoid quickjs conversion issues
+                 define("console") {
+                         function("log") { args ->
+-                            Log.d("Plugin:$scraperId", args.joinToString(" ") { it?.toString() ?: "null" })
++                            if (torrentResolveId == null) Log.d("Plugin:$scraperId", args.joinToString(" ") { it?.toString() ?: "null" })
+                             null
+                         }
+                         function("error") { args ->
+-                            Log.e("Plugin:$scraperId", args.joinToString(" ") { it?.toString() ?: "null" })
++                            if (torrentResolveId == null) Log.e("Plugin:$scraperId", args.joinToString(" ") { it?.toString() ?: "null" })
+                             null
+                         }
+                         function("warn") { args ->
+-                            Log.w("Plugin:$scraperId", args.joinToString(" ") { it?.toString() ?: "null" })
++                            if (torrentResolveId == null) Log.w("Plugin:$scraperId", args.joinToString(" ") { it?.toString() ?: "null" })
+                             null
+                         }
+                         function("info") { args ->
+-                            Log.i("Plugin:$scraperId", args.joinToString(" ") { it?.toString() ?: "null" })
++                            if (torrentResolveId == null) Log.i("Plugin:$scraperId", args.joinToString(" ") { it?.toString() ?: "null" })
+                             null
+                         }
+                         function("debug") { args ->
+-                            Log.d("Plugin:$scraperId", args.joinToString(" ") { it?.toString() ?: "null" })
++                            if (torrentResolveId == null) Log.d("Plugin:$scraperId", args.joinToString(" ") { it?.toString() ?: "null" })
+                             null
+                         }
+                     }
+@@ -298,12 +320,12 @@ class PluginRuntime @Inject constructor() {
+                         try {
+                             performNativeFetch(url, method, headersJson, bodyKind, body, followRedirects, inFlightCalls)
+                         } catch (t: Throwable) {
+-                            Log.e(TAG, "Async fetch bridge error for $method $url: ${t.message}")
++                            Log.e(TAG, "Async fetch bridge failed")
+                             gson.toJson(
+                                 mapOf(
+                                     "ok" to false,
+                                     "status" to 0,
+-                                    "statusText" to (t.message ?: "Fetch failed"),
++                                    "statusText" to "Fetch failed",
+                                     "url" to url,
+                                     "body" to "",
+                                     "bodyBase64" to "",
+@@ -485,7 +507,8 @@ class PluginRuntime @Inject constructor() {
+                             "tmdbId" to tmdbId,
+                             "mediaType" to mediaType,
+                             "season" to season,
+-                            "episode" to episode
++                            "episode" to episode,
++                            "torrentResolveId" to torrentResolveId
+                         )
+                     )
+                 }
+@@ -494,10 +517,12 @@ class PluginRuntime @Inject constructor() {
+                 evaluate<Any?>(callBytecode)
+             }
+ 
+-            return parseJsonResults(resultJson)
++            return resultJson
+ 
+         } catch (e: Exception) {
+-            Log.e(TAG, "Plugin execution failed: ${e.message}", e)
++            if (e is kotlinx.coroutines.CancellationException) throw e
++            if (torrentResolveId != null) throw TorrentSourceException("The plugin could not resolve torrent metadata")
++            Log.e(TAG, "Plugin execution failed")
+             throw e
+         } finally {
+             cancellationRegistration?.dispose()
+@@ -520,7 +545,7 @@ class PluginRuntime @Inject constructor() {
+         followRedirects: Boolean,
+         inFlightCalls: MutableSet<Call>
+     ): String {
+-        Log.d(TAG, "Fetch: $method $url bodyKind=$bodyKind")
++        Log.d(TAG, "Fetch: $method bodyKind=$bodyKind")
+         return try {
+             val requestBytes = when (bodyKind) {
+                 "base64" -> base64Decode(body)
+@@ -608,7 +633,7 @@ class PluginRuntime @Inject constructor() {
+                             }
+                         }
+                     } catch (e: Exception) {
+-                        Log.w(TAG, "Failed to read/decode response body for $url: ${e.message}")
++                        Log.w(TAG, "Failed to read/decode plugin response")
+                         BoundedReadResult(ByteArray(0), false)
+                     }
+ 
+@@ -627,18 +652,18 @@ class PluginRuntime @Inject constructor() {
+                         "truncated" to decodedRead.truncated
+                     )
+ 
+-                    Log.d(TAG, "Fetch result: ${httpResponse.code} ${httpResponse.message} url=$url bodyLen=${responseBody.length} bodyPreview=${responseBody.take(300)}")
++                    Log.d(TAG, "Fetch result: status=${httpResponse.code} bytes=${decodedRead.bytes.size}")
+                     gson.toJson(result)
+                 }
+             } finally {
+                 inFlightCalls.remove(call)
+             }
+         } catch (e: Exception) {
+-            Log.e(TAG, "Fetch error: ${e.message}")
++            Log.e(TAG, "Plugin fetch failed")
+             gson.toJson(mapOf(
+                 "ok" to false,
+                 "status" to 0,
+-                "statusText" to (e.message ?: "Fetch failed"),
++                "statusText" to "Fetch failed",
+                 "url" to url,
+                 "body" to "",
+                 "bodyBase64" to "",
+@@ -804,6 +829,7 @@ class PluginRuntime @Inject constructor() {
+                         }
+                     },
+                     arrayBuffer: function() {
++                        if (parsed.truncated) return Promise.reject(new Error('Binary response exceeds the 4 MiB limit'));
+                         var copy = new Uint8Array(responseBytes.length);
+                         copy.set(responseBytes);
+                         return Promise.resolve(copy.buffer);
+@@ -1407,14 +1433,34 @@ class PluginRuntime @Inject constructor() {
+         """.trimIndent()
+     }
+ 
+-    private fun parseJsonResults(json: String): List<LocalScraperResult> {
++    private fun parseTorrentSource(value: Any?): TorrentSource? {
++        val item = value as? Map<*, *> ?: return null
++        if (item["error"] != null) throw TorrentSourceException("Torrent resolution failed; sign in again or refresh the source")
++        fun string(key: String) = item[key] as? String
++        fun index(key: String): Int? {
++            val value = item[key] ?: return null
++            val number = value as? Number ?: error("Invalid torrent selector")
++            require(number.toDouble() == number.toInt().toDouble()) { "Invalid torrent selector" }
++            return number.toInt()
++        }
++        return TorrentSource(
++            url = string("url"), dataBase64 = string("dataBase64"), resolveId = string("resolveId"),
++            headers = (item["headers"] as? Map<*, *>)?.entries?.associate { (k, v) ->
++                require(k is String && v is String) { "Invalid torrent headers" }; k to v
++            }.orEmpty(),
++            fileIdx = index("fileIdx"), filename = string("filename"), season = index("season"), episode = index("episode")
++        ).also { it.validate() }
++    }
++
++    private fun parseJsonResults(json: String, torrentResolver: (suspend (String) -> TorrentSource)? = null): List<LocalScraperResult> {
+         return try {
+             val listType = object : com.google.gson.reflect.TypeToken<List<Map<String, Any?>>>() {}.type
+             val results: List<Map<String, Any?>>? = gson.fromJson(json, listType)
+             results?.mapNotNull { item ->
+                 // Handle URL - could be string or object with url property
+                 val urlValue = item["url"]
+-                val url = when (urlValue) {
++                val torrent = parseTorrentSource(item["torrent"])
++                val url = torrent?.let { TorrentSources.register(it, torrentResolver) } ?: when (urlValue) {
+                     is String -> urlValue.takeIf { it.isNotBlank() && !it.contains("[object") }
+                     is Map<*, *> -> (urlValue["url"] as? String)?.takeIf { it.isNotBlank() }
+                     else -> null
+@@ -1444,6 +1490,8 @@ class PluginRuntime @Inject constructor() {
+                     seeders = (item["seeders"] as? Number)?.toInt(),
+                     peers = (item["peers"] as? Number)?.toInt(),
+                     infoHash = item["infoHash"]?.toString()?.takeIf { !it.contains("[object") },
++                    fileIdx = (item["fileIdx"] as? Number)?.toInt(),
++                    sources = (item["sources"] as? List<*>)?.filterIsInstance<String>().orEmpty(),
+                     headers = headers,
+                     subtitles = parseSubtitles(item["subtitles"]),
+                     audioDelayMs = ((item["behaviorHints"] as? Map<*, *>)?.get("audioDelayMs") as? Number)
+@@ -1453,7 +1501,7 @@ class PluginRuntime @Inject constructor() {
+                 )
+             }?.filter { it.url.isNotBlank() } ?: emptyList()
+         } catch (e: Exception) {
+-            Log.e(TAG, "Failed to parse results: ${e.message}")
++            Log.e(TAG, "Failed to parse plugin results")
+             emptyList()
+         }
+     }
+diff --git a/app/src/main/java/com/nuvio/tv/core/debrid/DirectDebridResolver.kt b/app/src/main/java/com/nuvio/tv/core/debrid/DirectDebridResolver.kt
+index 403fa15..0083469 100644
+--- a/app/src/main/java/com/nuvio/tv/core/debrid/DirectDebridResolver.kt
++++ b/app/src/main/java/com/nuvio/tv/core/debrid/DirectDebridResolver.kt
+@@ -123,6 +123,7 @@ class DirectDebridResolver @Inject constructor(
+     }
+ 
+     suspend fun shouldResolveToPlayableStream(stream: Stream): Boolean {
++        if (com.nuvio.tv.core.torrent.TorrentSources.referenceFromUrl(stream.url) != null) return false
+         val settings = dataStore.settings.first()
+         if (!settings.canResolvePlayableLinks) return false
+         if (stream.needsLocalDebridResolve()) {
+diff --git a/app/src/main/java/com/nuvio/tv/core/torrent/TorrentService.kt b/app/src/main/java/com/nuvio/tv/core/torrent/TorrentService.kt
+index 7a0eaa8..0dabe55 100644
+--- a/app/src/main/java/com/nuvio/tv/core/torrent/TorrentService.kt
++++ b/app/src/main/java/com/nuvio/tv/core/torrent/TorrentService.kt
+@@ -45,7 +45,8 @@ class TorrentService @Inject constructor(
+     private data class EngineConfigurationKey(
+         val uploadEnabled: Boolean,
+         val torrentProfile: TorrentProfile,
+-        val diskCacheCapacityBytes: Long
++        val diskCacheCapacityBytes: Long,
++        val metadataSession: String? = null
+     )
+ 
+     private data class DetachedStream(
+@@ -137,21 +138,25 @@ class TorrentService @Inject constructor(
+         var attached = false
+         var startupStatsJob: Job? = null
+         return try {
++            val metadataSource = if (TorrentSources.isReference(infoHash)) TorrentSources.resolve(infoHash) else null
++            val metadataBytes = metadataSource?.let { TorrentMetadataLoader.load(it) }
+             phase.set("ensure_engine")
+-            val magnetUri = buildMagnetUri(infoHash, (DefaultTorrentTrackers + trackers).distinct())
+-            val resolvedEngine = ensureEngine()
++            val magnetUri = if (metadataBytes == null) buildMagnetUri(infoHash, (DefaultTorrentTrackers + trackers).distinct()) else null
++            val resolvedEngine = ensureEngine(if (metadataBytes != null) java.util.UUID.randomUUID().toString() else null)
+             activeEngine = resolvedEngine
+             val payloadDownloadBaseline = resolvedEngine.stats.value.totalPayloadDownloadBytes
+             ensureCurrentGeneration(generation)
+             startupStatsJob = startStartupStatsPolling(resolvedEngine, generation, phase)
+ 
+-            phase.set("add_magnet")
+-            val canonicalHash = canonicalInfoHash(infoHash)
++            phase.set(if (metadataBytes != null) "add_torrent" else "add_magnet")
++            val canonicalHash = if (metadataBytes == null) canonicalInfoHash(infoHash) else ""
+             val reusedTorrent = canonicalHash in knownTorrentIds
+-            val torrentId = if (reusedTorrent) {
++            val torrentId = if (metadataBytes != null) {
++                resolvedEngine.addTorrent(metadataBytes)
++            } else if (reusedTorrent) {
+                 canonicalHash
+             } else {
+-                resolvedEngine.addMagnet(magnetUri).also { knownTorrentIds += it }
++                resolvedEngine.addMagnet(requireNotNull(magnetUri)).also { knownTorrentIds += it }
+             }
+             ensureCurrentGeneration(generation)
+             logPhase(startedAtMs, phase.get(), "torrent=${diagnosticId(torrentId)} cached=$reusedTorrent")
+@@ -159,8 +164,11 @@ class TorrentService @Inject constructor(
+             phase.set("prepare_stream")
+             val stream = resolvedEngine.prepareStream(
+                 torrentId = torrentId,
+-                fileIndex = fileIdx,
+-                filenameHint = filename
++                fileIndex = metadataSource?.let { source ->
++                    selectMetadataFile(resolvedEngine.files(torrentId).map { TorrentMetadataFile(it.index, it.path, it.size) },
++                        source.copy(filename = source.filename ?: filename), fileIdx)
++                } ?: fileIdx,
++                filenameHint = if (metadataSource == null) filename else null
+             )
+             preparedStream = stream
+             logPhase(
+@@ -206,17 +214,20 @@ class TorrentService @Inject constructor(
+             }
+             throw cancellation
+         } catch (error: Exception) {
++            val safeError = if (TorrentSources.isReference(infoHash))
++                error as? TorrentSourceException ?: TorrentSourceException("Unable to start torrent playback; refresh the source")
++                else error
+             Log.e(
+                 TorrentDiagnosticTag,
+                 "start phase=${phase.get()} failed elapsedMs=${elapsedSince(startedAtMs)} " +
+-                    "error=${diagnosticMessage(error.message)}",
+-                error
++                    "error=${diagnosticMessage(safeError.message)}",
++                safeError
+             )
+-            val terminalState = TorrentState.Error(error.message ?: unknownErrorMessage())
++            val terminalState = TorrentState.Error(safeError.message ?: unknownErrorMessage())
+             withContext(NonCancellable) {
+                 cleanupFailedStart(generation, activeEngine, preparedStream, attached, terminalState)
+             }
+-            throw error
++            throw safeError
+         } finally {
+             startupStatsJob?.cancel()
+         }
+@@ -304,18 +315,20 @@ class TorrentService @Inject constructor(
+         }
+     }
+ 
+-    private suspend fun ensureEngine(): NuvioEngine {
++    private suspend fun ensureEngine(metadataSession: String? = null): NuvioEngine {
+         val settings = torrentSettings.settings.first()
+         val configurationKey = EngineConfigurationKey(
+             uploadEnabled = settings.enableUpload,
+             torrentProfile = settings.torrentProfile,
+-            diskCacheCapacityBytes = settings.cacheSize.bytes
++            diskCacheCapacityBytes = settings.cacheSize.bytes,
++            metadataSession = metadataSession
+         )
+         engine?.takeIf { engineConfigurationKey == configurationKey }?.let { return it }
+ 
+         closeEngine(engine)
+         currentCoroutineContext().ensureActive()
+-        val stateDirectory = File(context.noBackupFilesDir, "nuvio-engine/state")
++        val stateDirectory = if (metadataSession == null) File(context.noBackupFilesDir, "nuvio-engine/state")
++            else File(context.cacheDir, "nuvio-engine/authenticated/$metadataSession")
+         val cacheDirectory = File(context.cacheDir, "nuvio-engine")
+         check(stateDirectory.mkdirs() || stateDirectory.isDirectory) {
+             "Could not create the Nuvio Engine state directory"
+@@ -359,6 +372,7 @@ class TorrentService @Inject constructor(
+     }
+ 
+     private fun observeEngineEvents(activeEngine: NuvioEngine) {
++        val redactMetadata = engineConfigurationKey?.metadataSession != null
+         engineEventsJob?.cancel()
+         engineEventsJob = scope.launch {
+             launch {
+@@ -372,7 +386,7 @@ class TorrentService @Inject constructor(
+                 Log.i(
+                     TorrentDiagnosticTag,
+                     "event type=${event.type} requestId=${event.requestId} torrent=${diagnosticId(event.torrentId)} " +
+-                        "stream=${diagnosticId(event.streamId)} message=${diagnosticMessage(event.message)}"
++                        "stream=${diagnosticId(event.streamId)} message=${diagnosticMessage(if (redactMetadata) "[private torrent event]" else event.message)}"
+                 )
+                 if (engine !== activeEngine) return@collect
+                 when (event.type) {
+@@ -381,7 +395,7 @@ class TorrentService @Inject constructor(
+                         val error = unexpectedTorrentError(
+                             eventTorrentId = event.torrentId,
+                             currentTorrentId = currentTorrentId,
+-                            message = event.message,
++                            message = if (redactMetadata) "Torrent playback stopped; refresh the source" else event.message,
+                             fallbackMessage = unknownErrorMessage()
+                         ) ?: return@synchronized
+                         streamGeneration += 1
+@@ -395,7 +409,7 @@ class TorrentService @Inject constructor(
+                             requestId = event.requestId,
+                             eventStreamId = event.streamId,
+                             currentStreamId = currentStreamId,
+-                            message = event.message,
++                            message = if (redactMetadata) "Torrent playback stopped; refresh the source" else event.message,
+                             fallbackMessage = unknownErrorMessage()
+                         ) ?: return@synchronized
+                         streamGeneration += 1
+diff --git a/app/src/main/java/com/nuvio/tv/data/local/StreamLinkCacheDataStore.kt b/app/src/main/java/com/nuvio/tv/data/local/StreamLinkCacheDataStore.kt
+index 3f59b10..5902155 100644
+--- a/app/src/main/java/com/nuvio/tv/data/local/StreamLinkCacheDataStore.kt
++++ b/app/src/main/java/com/nuvio/tv/data/local/StreamLinkCacheDataStore.kt
+@@ -78,6 +78,8 @@ class StreamLinkCacheDataStore @Inject constructor(
+         usenetEpisode: Int? = null
+     ) {
+         // Loopback Usenet capabilities expire with the playback process; the release is kept instead.
++        if (com.nuvio.tv.core.torrent.TorrentSources.isReference(infoHash) ||
++            com.nuvio.tv.core.torrent.TorrentSources.referenceFromUrl(url) != null) return
+         if (com.nuvio.tv.core.usenet.UsenetSidecar.isSessionUrl(url)) return
+         val payload = JSONObject().apply {
+             nzbUrl?.let { put("nzbUrl", it) }
+diff --git a/app/src/main/java/com/nuvio/tv/data/mapper/StreamMapper.kt b/app/src/main/java/com/nuvio/tv/data/mapper/StreamMapper.kt
+index 7f28571..972c410 100644
+--- a/app/src/main/java/com/nuvio/tv/data/mapper/StreamMapper.kt
++++ b/app/src/main/java/com/nuvio/tv/data/mapper/StreamMapper.kt
+@@ -22,7 +22,7 @@ fun StreamDto.toDomain(addonName: String, addonLogo: String?): Stream = Stream(
+     name = name,
+     title = title,
+     description = description,
+-    url = url,
++    url = torrent?.register() ?: url,
+     nzbUrl = nzbUrl,
+     servers = servers,
+     fileMustInclude = fileMustInclude,
+diff --git a/app/src/main/java/com/nuvio/tv/data/remote/dto/StreamResponseDto.kt b/app/src/main/java/com/nuvio/tv/data/remote/dto/StreamResponseDto.kt
+index 6039efb..d1a7e2c 100644
+--- a/app/src/main/java/com/nuvio/tv/data/remote/dto/StreamResponseDto.kt
++++ b/app/src/main/java/com/nuvio/tv/data/remote/dto/StreamResponseDto.kt
+@@ -10,6 +10,7 @@ data class StreamResponseDto(
+ 
+ @JsonClass(generateAdapter = true)
+ data class StreamDto(
++    @Json(name = "torrent") val torrent: TorrentSourceDto? = null,
+     @Json(name = "name") val name: String? = null,
+     @Json(name = "title") val title: String? = null,
+     @Json(name = "description") val description: String? = null,
+@@ -27,6 +28,23 @@ data class StreamDto(
+     @Json(name = "clientResolve") val clientResolve: StreamClientResolveDto? = null
+ )
+ 
++@JsonClass(generateAdapter = true)
++data class TorrentSourceDto(
++    @Json(name = "url") val url: String? = null,
++    @Json(name = "dataBase64") val dataBase64: String? = null,
++    @Json(name = "headers") val headers: Map<String, String>? = null,
++    @Json(name = "fileIdx") val fileIdx: Int? = null,
++    @Json(name = "filename") val filename: String? = null,
++    @Json(name = "season") val season: Int? = null,
++    @Json(name = "episode") val episode: Int? = null,
++) {
++    override fun toString(): String = "TorrentSourceDto([redacted])"
++    fun register(): String = com.nuvio.tv.core.torrent.TorrentSources.register(
++        com.nuvio.tv.core.torrent.TorrentSource(url, dataBase64, headers.orEmpty(), fileIdx = fileIdx,
++            filename = filename, season = season, episode = episode)
++    )
++}
++
+ @JsonClass(generateAdapter = true)
+ data class StreamClientResolveDto(
+     @Json(name = "type") val type: String? = null,
+@@ -118,4 +136,3 @@ data class SubtitleDto(
+     @Json(name = "label") val label: String? = null,
+     @Json(name = "headers") val headers: Map<String, String>? = null
+ )
+-
+diff --git a/app/src/main/java/com/nuvio/tv/domain/model/Plugin.kt b/app/src/main/java/com/nuvio/tv/domain/model/Plugin.kt
+index d5d375f..7662d5f 100644
+--- a/app/src/main/java/com/nuvio/tv/domain/model/Plugin.kt
++++ b/app/src/main/java/com/nuvio/tv/domain/model/Plugin.kt
+@@ -114,7 +114,9 @@ data class LocalScraperResult(
+     val headers: Map<String, String>? = null,
+     val subtitles: List<Subtitle> = emptyList(),
+     val audioDelayMs: Int? = null,
+-    val audioDelayLanguage: String? = null
++    val audioDelayLanguage: String? = null,
++    val fileIdx: Int? = null,
++    val sources: List<String> = emptyList()
+ )
+ 
+ /**
+@@ -335,7 +337,7 @@ fun LocalScraperResult.toStream(scraper: ScraperInfo): com.nuvio.tv.domain.model
+         url = url,
+         ytId = null,
+         infoHash = infoHash,
+-        fileIdx = null,
++        fileIdx = fileIdx,
+         externalUrl = null,
+         behaviorHints = StreamBehaviorHints(
+             notWebReady = null,
+@@ -352,6 +354,7 @@ fun LocalScraperResult.toStream(scraper: ScraperInfo): com.nuvio.tv.domain.model
+             audioDelayMs = audioDelayMs,
+             audioDelayLanguage = audioDelayLanguage
+         ),
++        sources = sources,
+         addonName = scraper.name,
+         addonLogo = scraper.logo,
+         subtitles = subtitles
+diff --git a/app/src/main/java/com/nuvio/tv/domain/model/Stream.kt b/app/src/main/java/com/nuvio/tv/domain/model/Stream.kt
+index b601949..9c0ad0a 100644
+--- a/app/src/main/java/com/nuvio/tv/domain/model/Stream.kt
++++ b/app/src/main/java/com/nuvio/tv/domain/model/Stream.kt
+@@ -71,7 +71,8 @@ data class Stream(
+         isTorrent() && getStreamUrl().isNullOrBlank()
+ 
+     fun getEffectiveInfoHash(): String? =
+-        infoHash?.takeIf { it.isNotBlank() }
++        com.nuvio.tv.core.torrent.TorrentSources.referenceFromUrl(url)
++            ?: infoHash?.takeIf { it.isNotBlank() }
+             ?: clientResolve?.infoHash?.takeIf { it.isNotBlank() }
+             ?: url?.let { extractInfoHashFromTorrentUrl(it) ?: extractInfoHashFromMagnetLink(it) }
+             ?: externalUrl?.let { extractInfoHashFromTorrentUrl(it) ?: extractInfoHashFromMagnetLink(it) }
+diff --git a/app/src/androidTest/java/com/nuvio/tv/core/torrent/TorrentMetadataNativeTest.kt b/app/src/androidTest/java/com/nuvio/tv/core/torrent/TorrentMetadataNativeTest.kt
+new file mode 100644
+index 0000000..79332bd
+--- /dev/null
++++ b/app/src/androidTest/java/com/nuvio/tv/core/torrent/TorrentMetadataNativeTest.kt
+@@ -0,0 +1,68 @@
++package com.nuvio.tv.core.torrent
++
++import androidx.test.ext.junit.runners.AndroidJUnit4
++import androidx.test.platform.app.InstrumentationRegistry
++import com.nuvio.engine.NuvioEngine
++import com.nuvio.engine.NuvioEngineConfig
++import com.nuvio.engine.NuvioUploadMode
++import com.nuvio.tv.core.torrent.TorrentMetadataFile
++import com.nuvio.tv.core.torrent.TorrentSource
++import com.nuvio.tv.core.torrent.selectMetadataFile
++import java.io.File
++import java.security.MessageDigest
++import java.util.UUID
++import kotlinx.coroutines.runBlocking
++import kotlinx.coroutines.withTimeout
++import org.junit.Assert.*
++import org.junit.Test
++import org.junit.runner.RunWith
++
++/** Runs against the actual Android JNI library, without a provider account or real content. */
++@RunWith(AndroidJUnit4::class)
++class TorrentMetadataNativeTest {
++    @Test fun completePrivateMetadataImportsWithOriginalHashAndFileIndices() = runBlocking {
++        val context = InstrumentationRegistry.getInstrumentation().targetContext
++        val root = File(context.cacheDir, "torrent-native-test/${UUID.randomUUID()}")
++        val engine = NuvioEngine.create(NuvioEngineConfig(
++            dataDirectory = File(root, "state"), cacheDirectory = File(root, "cache"),
++            memoryCacheCapacityBytes = 1024 * 1024, diskCacheCapacityBytes = 0,
++            uploadMode = NuvioUploadMode.Disabled,
++        ))
++        try {
++            val info = mapOf("name" to "season", "private" to 1, "piece length" to 16384,
++                "pieces" to ByteArray(20), "files" to listOf(
++                    mapOf("length" to 4, "path" to listOf("Example.S01E01.mkv")),
++                    mapOf("length" to 8, "path" to listOf("Example.S01E02.mkv"))
++                ))
++            val originalInfo = bencode(info)
++            val metadata = bencode(mapOf("announce" to "https://tracker.invalid/private/dummy/announce", "info" to info))
++            val id = withTimeout(15_000L) { engine.addTorrent(metadata) }
++            val expected = MessageDigest.getInstance("SHA-1").digest(originalInfo).joinToString("") { "%02x".format(it.toInt() and 0xff) }
++            assertEquals(expected, id)
++            val files = engine.files(id)
++            assertEquals(listOf(0, 1), files.map { it.index })
++            assertEquals(listOf(4L, 8L), files.map { it.size })
++            val selected = selectMetadataFile(files.map { TorrentMetadataFile(it.index, it.path, it.size) },
++                TorrentSource(dataBase64 = "ZGU=", season = 1, episode = 2), null)
++            assertEquals(1, selected)
++            val stream = withTimeout(15_000L) { engine.prepareStream(id, fileIndex = selected) }
++            assertEquals(1, stream.fileIndex)
++            assertEquals(8L, stream.fileSize)
++            assertTrue(stream.url.startsWith("http://127.0.0.1:"))
++            engine.stopStream(stream.id)
++        } finally {
++            engine.shutdown()
++        }
++    }
++
++    private fun bencode(value: Any): ByteArray = when (value) {
++        is ByteArray -> "${value.size}:".toByteArray() + value
++        is String -> bencode(value.toByteArray())
++        is Number -> "i${value.toLong()}e".toByteArray()
++        is List<*> -> "l".toByteArray() + value.fold(byteArrayOf()) { result, item -> result + bencode(requireNotNull(item)) } + "e".toByteArray()
++        is Map<*, *> -> "d".toByteArray() + value.entries.sortedBy { it.key.toString() }.fold(byteArrayOf()) { result, entry ->
++            result + bencode(entry.key.toString()) + bencode(requireNotNull(entry.value))
++        } + "e".toByteArray()
++        else -> error("Unsupported fixture value")
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/torrent/TorrentMetadataLoader.kt b/app/src/main/java/com/nuvio/tv/core/torrent/TorrentMetadataLoader.kt
+new file mode 100644
+index 0000000..e3c3553
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/torrent/TorrentMetadataLoader.kt
+@@ -0,0 +1,111 @@
++package com.nuvio.tv.core.torrent
++
++import java.io.ByteArrayOutputStream
++import java.io.IOException
++import java.util.Base64
++import kotlin.coroutines.resume
++import kotlin.coroutines.resumeWithException
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.TimeoutCancellationException
++import kotlinx.coroutines.suspendCancellableCoroutine
++import kotlinx.coroutines.withTimeout
++import okhttp3.Call
++import okhttp3.Callback
++import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
++import okhttp3.OkHttpClient
++import okhttp3.Request
++import okhttp3.Response
++import java.util.concurrent.TimeUnit
++
++/** Fetch only after selection; never reinterpret torrent metadata as UTF-8. */
++object TorrentMetadataLoader {
++    private val client = OkHttpClient.Builder()
++        .followRedirects(false).followSslRedirects(false)
++        .callTimeout(30, TimeUnit.SECONDS).build()
++
++    suspend fun load(source: TorrentSource): ByteArray = try {
++        source.validate(allowResolver = false)
++        val bytes = if (source.dataBase64 != null) {
++            Base64.getDecoder().decode(source.dataBase64)
++        } else {
++            download(requireNotNull(source.url), source.headers)
++        }
++        require(bytes.isNotEmpty() && bytes.size <= MAX_TORRENT_BYTES) { "Invalid torrent size" }
++        bytes
++    } catch (_: TimeoutCancellationException) {
++        throw TorrentSourceException("Torrent metadata download timed out; try again")
++    } catch (cancelled: CancellationException) {
++        throw cancelled
++    } catch (error: TorrentSourceException) {
++        throw error
++    } catch (_: Exception) {
++        throw TorrentSourceException("Invalid or unavailable torrent metadata (maximum 4 MiB)")
++    }
++
++    private suspend fun download(rawUrl: String, headers: Map<String, String>): ByteArray = withTimeout(60_000L) {
++        val origin = rawUrl.toHttpUrlOrNull() ?: error("Invalid torrent URL")
++        require(origin.username.isEmpty() && origin.password.isEmpty())
++        var url = origin
++        repeat(6) {
++            val request = Request.Builder().url(url).header("Accept", "application/x-bittorrent").apply {
++                // Custom cookies/headers must not follow a redirect to another origin.
++                if (url.scheme == origin.scheme && url.host == origin.host && url.port == origin.port) {
++                    headers.forEach { (key, value) -> header(key, value) }
++                }
++            }.build()
++            val result = read(client.newCall(request))
++            if (result.redirect == null) return@withTimeout result.bytes
++            val redirected = url.resolve(result.redirect) ?: error("Invalid torrent redirect")
++            require(redirected.username.isEmpty() && redirected.password.isEmpty())
++            require(url.scheme != "https" || redirected.scheme == "https")
++            url = redirected
++        }
++        throw TorrentSourceException("Too many redirects while resolving torrent metadata")
++    }
++
++    private data class ReadResult(val bytes: ByteArray = byteArrayOf(), val redirect: String? = null)
++
++    private suspend fun read(call: Call): ReadResult = suspendCancellableCoroutine { continuation ->
++        continuation.invokeOnCancellation { call.cancel() }
++        call.enqueue(object : Callback {
++            override fun onFailure(call: Call, e: IOException) {
++                if (continuation.isActive) continuation.resumeWithException(
++                    TorrentSourceException("Torrent download failed; refresh the source or sign in again")
++                )
++            }
++
++            override fun onResponse(call: Call, response: Response) {
++                try {
++                    val result = response.use {
++                        if (it.code in listOf(301, 302, 303, 307, 308)) {
++                            ReadResult(redirect = it.header("Location") ?: error("Missing redirect"))
++                        } else {
++                            if (it.code == 401 || it.code == 403) {
++                                throw TorrentSourceException("Torrent authentication failed or expired; sign in again")
++                            }
++                            require(it.isSuccessful)
++                            val body = requireNotNull(it.body)
++                            require(body.contentLength() <= MAX_TORRENT_BYTES)
++                            val output = ByteArrayOutputStream()
++                            body.byteStream().use { stream ->
++                                val buffer = ByteArray(8192)
++                                while (true) {
++                                    val count = stream.read(buffer)
++                                    if (count < 0) break
++                                    require(output.size() + count <= MAX_TORRENT_BYTES)
++                                    output.write(buffer, 0, count)
++                                }
++                            }
++                            ReadResult(output.toByteArray())
++                        }
++                    }
++                    if (continuation.isActive) continuation.resume(result)
++                } catch (error: Exception) {
++                    if (continuation.isActive) continuation.resumeWithException(
++                        error as? TorrentSourceException ?: TorrentSourceException("Invalid torrent response (maximum 4 MiB)")
++                    )
++                }
++            }
++        })
++    }
++}
+diff --git a/app/src/main/java/com/nuvio/tv/core/torrent/TorrentSources.kt b/app/src/main/java/com/nuvio/tv/core/torrent/TorrentSources.kt
+new file mode 100644
+index 0000000..f186ba7
+--- /dev/null
++++ b/app/src/main/java/com/nuvio/tv/core/torrent/TorrentSources.kt
+@@ -0,0 +1,129 @@
++package com.nuvio.tv.core.torrent
++
++import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.TimeoutCancellationException
++import kotlinx.coroutines.flow.MutableStateFlow
++import kotlinx.coroutines.flow.update
++import kotlinx.coroutines.withTimeout
++import kotlin.uuid.ExperimentalUuidApi
++import kotlin.uuid.Uuid
++
++/** Optional wire contract shared by JS providers and HTTP add-ons. Never persist this object. */
++data class TorrentSource(
++    val url: String? = null,
++    val dataBase64: String? = null,
++    val headers: Map<String, String> = emptyMap(),
++    val resolveId: String? = null,
++    val fileIdx: Int? = null,
++    val filename: String? = null,
++    val season: Int? = null,
++    val episode: Int? = null,
++) {
++    fun validate(allowResolver: Boolean = true) {
++        require(listOf(url, dataBase64, resolveId).count { !it.isNullOrBlank() } == 1) {
++            "A torrent source must contain exactly one URL, dataBase64 or resolveId"
++        }
++        require(allowResolver || resolveId == null) { "Recursive torrent resolution is not supported" }
++        require(fileIdx == null || fileIdx >= 0) { "Invalid torrent file index" }
++        require((season == null) == (episode == null) && (season == null || season >= 0) &&
++            (episode == null || episode >= 0)) { "Invalid torrent episode selector" }
++        require(url == null || (url.length <= 16_384 &&
++            (url.startsWith("https://") || url.startsWith("http://")))) { "Invalid torrent URL" }
++        require(dataBase64 == null || dataBase64.length <= MAX_TORRENT_BASE64_CHARS) {
++            "Torrent metadata exceeds the 4 MiB limit"
++        }
++        require(resolveId == null || resolveId.length <= 16_384) { "Torrent reference is too large" }
++        require(headers.size <= 64 && headers.all { (key, value) ->
++            key.isNotBlank() && key.length <= 256 && value.length <= 8192 &&
++                '\r' !in key && '\n' !in key && '\r' !in value && '\n' !in value
++        }) { "Invalid torrent request headers" }
++    }
++
++    // URLs, tokens, passkeys and bencoded metadata must never appear in a model log.
++    override fun toString(): String = "TorrentSource([redacted])"
++}
++
++const val MAX_TORRENT_BYTES = 4 * 1024 * 1024
++const val MAX_TORRENT_BASE64_CHARS = ((MAX_TORRENT_BYTES + 2) / 3) * 4
++
++/**
++ * Navigation uses an opaque process-local reference, never torrent bytes or authenticated URLs.
++ * Existing P2P routing carries this reference in its source/hash slot; the native loader explicitly
++ * distinguishes it from an info hash. References cannot be replayed after process death.
++ */
++object TorrentSources {
++    private const val PREFIX = "nuvio-torrent:"
++    private data class Entry(val cost: Int, val resolve: suspend () -> TorrentSource)
++    private val entries = MutableStateFlow<Map<String, Entry>>(emptyMap())
++
++    @OptIn(ExperimentalUuidApi::class)
++    fun register(source: TorrentSource, resolver: (suspend (String) -> TorrentSource)? = null): String {
++        source.validate()
++        require(source.resolveId == null || resolver != null) { "Torrent resolver is unavailable" }
++        val reference = PREFIX + Uuid.random().toString()
++        val entry = Entry(source.dataBase64?.length ?: 16_384) {
++            val resolved = source.resolveId?.let { resolver!!.invoke(it) } ?: source
++            resolved.validate(allowResolver = false)
++            resolved.copy(fileIdx = resolved.fileIdx ?: source.fileIdx, filename = resolved.filename ?: source.filename,
++                season = resolved.season ?: source.season, episode = resolved.episode ?: source.episode)
++        }
++        entries.update { previous ->
++            val next = previous.toMutableMap()
++            next[reference] = entry
++            var cost = next.values.sumOf { it.cost }
++            while (next.size > 512 || cost > 32 * 1024 * 1024) {
++                val oldest = next.keys.first()
++                cost -= next.remove(oldest)!!.cost
++            }
++            next
++        }
++        return "torrent://$reference"
++    }
++
++    fun isReference(value: String?): Boolean = value?.startsWith(PREFIX) == true
++
++    fun referenceFromUrl(value: String?): String? = value
++        ?.takeIf { it.startsWith("torrent://$PREFIX") }
++        ?.removePrefix("torrent://")?.substringBefore('?')?.substringBefore('/')
++
++    suspend fun resolve(reference: String): TorrentSource = try {
++        val entry = entries.value[reference] ?: error("Torrent source expired; refresh the stream list")
++        withTimeout(60_000L) { entry.resolve() }
++    } catch (_: TimeoutCancellationException) {
++        throw TorrentSourceException("Torrent metadata resolution timed out; try again")
++    } catch (cancelled: CancellationException) {
++        throw cancelled
++    } catch (error: TorrentSourceException) {
++        throw error
++    } catch (_: Exception) {
++        // A plugin or HTTP exception can contain a complete authenticated URL.
++        throw TorrentSourceException("Unable to resolve torrent metadata; refresh the source or sign in again")
++    }
++}
++
++class TorrentSourceException(message: String) : Exception(message)
++
++data class TorrentMetadataFile(val index: Int, val path: String, val size: Long)
++
++/** Never silently play another episode or fall back from an invalid explicit index. */
++fun selectMetadataFile(files: List<TorrentMetadataFile>, source: TorrentSource, fallbackIndex: Int?): Int {
++    val videos = files.filter { it.size > 0 && Regex("(?i)\\.(mkv|mp4|avi|mov|m4v|ts|m2ts|webm|mpeg|mpg|wmv|flv|vp8|ogv)$").containsMatchIn(it.path) }
++    val index = source.fileIdx ?: fallbackIndex
++    if (index != null) return videos.firstOrNull { it.index == index }?.index
++        ?: throw TorrentSourceException("The selected torrent file is missing or is not a video")
++    val episode = source.episode
++    val season = source.season
++    if (episode != null && season != null) {
++        val pattern = Regex("(?i)(?:^|[^a-z0-9])(?:s0*$season[ ._-]*e0*$episode|0*${season}x0*$episode|season[ ./_-]*0*$season[ ./_-]+(?:episode|ep)[ ._-]*0*$episode)(?:[^0-9]|$)")
++        return videos.filter { pattern.containsMatchIn(it.path) }.maxByOrNull { it.size }?.index
++            ?: throw TorrentSourceException("The requested episode is not present in this torrent")
++    }
++    source.filename?.let { filename ->
++        val exact = videos.filter { it.path.replace('\\', '/') == filename.replace('\\', '/') ||
++            it.path.substringAfterLast('/').substringAfterLast('\\') == filename }
++        return exact.singleOrNull()?.index
++            ?: throw TorrentSourceException("The requested torrent filename is missing or ambiguous")
++    }
++    return videos.filterNot { Regex("(?i)(?:^|[ /._-])sample(?:[ /._-]|$)").containsMatchIn(it.path) }
++        .maxByOrNull { it.size }?.index ?: throw TorrentSourceException("No playable video was found in this torrent")
++}
+diff --git a/app/src/test/java/com/nuvio/tv/core/torrent/TorrentMetadataTest.kt b/app/src/test/java/com/nuvio/tv/core/torrent/TorrentMetadataTest.kt
+new file mode 100644
+index 0000000..0ebc8ea
+--- /dev/null
++++ b/app/src/test/java/com/nuvio/tv/core/torrent/TorrentMetadataTest.kt
+@@ -0,0 +1,113 @@
++package com.nuvio.tv.core.torrent
++
++import java.util.Base64
++import java.util.concurrent.TimeUnit
++import kotlinx.coroutines.runBlocking
++import okhttp3.mockwebserver.MockResponse
++import okhttp3.mockwebserver.MockWebServer
++import okio.Buffer
++import org.junit.Assert.*
++import org.junit.Test
++
++class TorrentMetadataTest {
++    @Test fun `resolution happens after selection and preserves selectors`() = runBlocking<Unit> {
++        var calls = 0
++        val url = TorrentSources.register(TorrentSource(resolveId = "source-1", season = 1, episode = 2)) { id ->
++            assertEquals("source-1", id)
++            calls++
++            TorrentSource(dataBase64 = "ZGU=")
++        }
++        assertEquals(0, calls)
++        assertFalse(url.contains("source-1"))
++        val result = TorrentSources.resolve(requireNotNull(TorrentSources.referenceFromUrl(url)))
++        assertEquals(1, calls)
++        assertEquals(2, result.episode)
++        assertEquals(1, result.season)
++    }
++
++    @Test fun `private torrent bytes are never decoded or reconstructed`() = runBlocking<Unit> {
++        val tracker = "https://tracker.invalid/passkey/announce"
++        val bytes = ("d8:announce${tracker.length}:$tracker" +
++            "4:infod6:lengthi4e4:name9:movie.mkv12:piece lengthi16384e6:pieces20:").toByteArray() +
++            ByteArray(20) { index -> if (index % 2 == 0) 0x80.toByte() else 0xff.toByte() } +
++            "7:privatei1eee".toByteArray()
++        MockWebServer().use { server ->
++            server.enqueue(MockResponse().setBody(Buffer().write(bytes)))
++            val source = TorrentSource(url = server.url("/download?apikey=secret").toString())
++            assertArrayEquals(bytes, TorrentMetadataLoader.load(source))
++            assertEquals("application/x-bittorrent", server.takeRequest().getHeader("Accept"))
++            assertFalse(source.toString().contains("secret"))
++        }
++        assertArrayEquals(bytes, TorrentMetadataLoader.load(TorrentSource(dataBase64 = Base64.getEncoder().encodeToString(bytes))))
++    }
++
++    @Test fun `oversized streamed bodies fail instead of being truncated`() = runBlocking<Unit> {
++        MockWebServer().use { server ->
++            server.enqueue(MockResponse().setChunkedBody(Buffer().write(ByteArray(MAX_TORRENT_BYTES + 1)), 8192))
++            expectSourceError { TorrentMetadataLoader.load(TorrentSource(url = server.url("/large").toString())) }
++        }
++    }
++
++    @Test fun `authentication errors do not expose credentials or response bodies`() = runBlocking<Unit> {
++        MockWebServer().use { server ->
++            server.enqueue(MockResponse().setResponseCode(403).setBody("token=secret"))
++            val error = expectSourceError { TorrentMetadataLoader.load(TorrentSource(url = server.url("/secret").toString())) }
++            assertTrue(error.message!!.contains("authentication"))
++            assertFalse(error.toString().contains("secret"))
++            assertNull(error.cause)
++        }
++    }
++
++    @Test fun `redirects do not forward custom authentication to another origin`() = runBlocking<Unit> {
++        MockWebServer().use { origin ->
++            MockWebServer().use { target ->
++                target.enqueue(MockResponse().setBody("de"))
++                origin.enqueue(MockResponse().setResponseCode(302).setHeader("Location", target.url("/torrent")))
++                TorrentMetadataLoader.load(TorrentSource(url = origin.url("/download").toString(),
++                    headers = mapOf("Authorization" to "Bearer secret", "Cookie" to "session=secret", "X-Api-Key" to "secret")))
++                assertEquals("Bearer secret", origin.takeRequest().getHeader("Authorization"))
++                val request = target.takeRequest(5, TimeUnit.SECONDS)!!
++                assertNull(request.getHeader("Authorization"))
++                assertNull(request.getHeader("Cookie"))
++                assertNull(request.getHeader("X-Api-Key"))
++            }
++        }
++    }
++
++    @Test fun `malformed and empty base64 fail without leaking the value`() = runBlocking<Unit> {
++        expectSourceError { TorrentMetadataLoader.load(TorrentSource(dataBase64 = "passkey!")) }
++        expectSourceError { TorrentMetadataLoader.load(TorrentSource(dataBase64 = "")) }
++    }
++
++    @Test fun `episode selection preserves original indices and avoids episode twenty`() {
++        val files = listOf(TorrentMetadataFile(0, "cover.jpg", 20),
++            TorrentMetadataFile(1, "Show.S01E20.mkv", 3000),
++            TorrentMetadataFile(2, "Show.S01E02.mkv", 2000),
++            TorrentMetadataFile(3, "Show.S01E01.mkv", 4000))
++        assertEquals(2, selectMetadataFile(files, TorrentSource(url = "https://example.org/torrent", season = 1, episode = 2), null))
++        assertThrows(TorrentSourceException::class.java) {
++            selectMetadataFile(files, TorrentSource(url = "https://example.org/torrent", season = 2, episode = 2), null)
++        }
++        assertThrows(TorrentSourceException::class.java) {
++            selectMetadataFile(files, TorrentSource(url = "https://example.org/torrent", fileIdx = 99), null)
++        }
++        assertThrows(TorrentSourceException::class.java) {
++            selectMetadataFile(files, TorrentSource(url = "https://example.org/torrent", fileIdx = 0), null)
++        }
++    }
++
++    @Test fun `movie selection ignores samples and honors explicit file indices`() {
++        val files = listOf(TorrentMetadataFile(0, "sample.mkv", 5000), TorrentMetadataFile(4, "movie.mkv", 2000))
++        assertEquals(4, selectMetadataFile(files, TorrentSource(url = "https://example.org/torrent"), null))
++        assertEquals(0, selectMetadataFile(files, TorrentSource(url = "https://example.org/torrent", fileIdx = 0), null))
++        assertEquals(0, selectMetadataFile(files, TorrentSource(url = "https://example.org/torrent", fileIdx = 0, filename = "movie.mkv"), null))
++        assertThrows(TorrentSourceException::class.java) {
++            selectMetadataFile(files, TorrentSource(url = "https://example.org/torrent", filename = "missing.mkv"), null)
++        }
++    }
++
++    private suspend fun expectSourceError(block: suspend () -> Unit): TorrentSourceException {
++        try { block() } catch (error: TorrentSourceException) { return error }
++        throw AssertionError("Expected a safe torrent metadata error")
++    }
++}
+diff --git a/app/src/test/java/com/nuvio/tv/core/torrent/TorrentSourceStreamTest.kt b/app/src/test/java/com/nuvio/tv/core/torrent/TorrentSourceStreamTest.kt
+new file mode 100644
+index 0000000..4444d69
+--- /dev/null
++++ b/app/src/test/java/com/nuvio/tv/core/torrent/TorrentSourceStreamTest.kt
+@@ -0,0 +1,29 @@
++package com.nuvio.tv.core.torrent
++
++import com.nuvio.tv.data.mapper.toDomain
++import com.nuvio.tv.data.remote.dto.StreamResponseDto
++import com.squareup.moshi.Moshi
++import org.junit.Assert.*
++import org.junit.Test
++
++class TorrentSourceStreamTest {
++    @Test fun `HTTP addon metadata source is playable without a URL or hash`() {
++        val payload = """{"streams":[{"name":"Example","torrent":{"url":"https://example.org/download?key=dummy","season":1,"episode":2}}]}"""
++        val dto = Moshi.Builder().build().adapter(StreamResponseDto::class.java).fromJson(payload)!!.streams!!.single()
++        val stream = dto.toDomain("Example", null)
++        assertTrue(stream.isTorrent())
++        assertFalse(stream.isExternal())
++        assertNull(stream.getStreamUrl())
++        assertTrue(TorrentSources.isReference(stream.getEffectiveInfoHash()))
++        assertFalse(stream.toString().contains("dummy"))
++    }
++
++    @Test fun `legacy HTTP and hash sources keep their routing`() {
++        val payload = """{"streams":[{"url":"https://example.org/movie.mp4"},{"infoHash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}"""
++        val streams = Moshi.Builder().build().adapter(StreamResponseDto::class.java).fromJson(payload)!!.streams!!.map { it.toDomain("Example", null) }
++        assertFalse(streams[0].isTorrent())
++        assertEquals("https://example.org/movie.mp4", streams[0].getStreamUrl())
++        assertTrue(streams[1].isTorrent())
++        assertEquals("a".repeat(40), streams[1].getEffectiveInfoHash())
++    }
++}

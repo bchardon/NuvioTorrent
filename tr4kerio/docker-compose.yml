@@ -1,0 +1,23 @@
+services:
+  tr4kerio:
+    build: .
+    container_name: tr4kerio
+    restart: unless-stopped
+
+    environment:
+      PORT: 7000
+      TORZNAB_URL: https://c411.org/api
+      TRACKER_HOSTNAMES: c411.org
+      TRACKER_PROXY_URL: https://tr4ker.lyno.top/tracker
+      REQUEST_TIMEOUT_MS: 15000
+      RESULTS_PER_QUALITY: 2
+
+    expose:
+      - "7000"
+
+    networks:
+      - caddy-network
+
+networks:
+  caddy-network:
+    external: true

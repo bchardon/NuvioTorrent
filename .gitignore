@@ -1,0 +1,7 @@
+work/
+*.apk
+local.properties
+local.dev.properties
+.env
+node_modules/
+__pycache__/

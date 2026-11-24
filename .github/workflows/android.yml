@@ -1,0 +1,143 @@
+name: NuvioTorrent Android
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      native_smoke:
+        description: Test the real torrent JNI library on an Android emulator
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  addon:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Test lazy native sources and legacy compatibility
+        run: npm test --prefix tr4kerio
+
+  android:
+    name: Build and test ${{ matrix.platform }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: tv
+            repository: NuvioMedia/NuvioTV
+            commit: 77cc0bb5f42f55c5e3877fc4d57a7df510c3f42b
+          - platform: mobile
+            repository: NuvioMedia/NuvioMobile
+            commit: 0d20af832d381e5ab3a385deccfbc47c12b93bf1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.commit }}
+          path: work/${{ matrix.platform }}
+          persist-credentials: false
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: gradle/actions/setup-gradle@v4
+      - uses: android-actions/setup-android@v3
+      - name: Apply pinned source patches
+        run: python3 scripts/prepare.py '${{ matrix.platform }}' --destination 'work/${{ matrix.platform }}'
+      - name: Test JavaScript resolver contract
+        run: node scripts/test-contract.js '${{ matrix.platform }}' 'work/${{ matrix.platform }}'
+      - name: Prepare runtime properties
+        env:
+          TV_PROPERTIES: ${{ secrets.NUVIO_TV_LOCAL_PROPERTIES_BASE64 }}
+          MOBILE_PROPERTIES: ${{ secrets.NUVIO_MOBILE_LOCAL_PROPERTIES_BASE64 }}
+          PLATFORM: ${{ matrix.platform }}
+        shell: bash
+        run: |
+          if [ "$PLATFORM" = tv ]; then properties="$TV_PROPERTIES"; else properties="$MOBILE_PROPERTIES"; fi
+          if [ -n "$properties" ]; then
+            printf '%s' "$properties" | base64 --decode > "work/$PLATFORM/local.properties"
+            sed -i -E '/^[[:space:]]*(sdk\.dir|NUVIO_RELEASE_STORE_FILE)[[:space:]]*=/d' "work/$PLATFORM/local.properties"
+          else
+            touch "work/$PLATFORM/local.properties"
+          fi
+      - name: Fetch TV native sidecars
+        if: matrix.platform == 'tv'
+        working-directory: work/tv
+        run: |
+          python3 native/usenet/scripts/fetch_prebuilts.py
+          python3 native/usenet/scripts/check_prebuilts.py
+      - name: Prepare TV CI signing
+        if: matrix.platform == 'tv'
+        run: |
+          keytool -genkeypair -keystore "$RUNNER_TEMP/ci-debug.jks" -storepass android -alias androiddebugkey -keypass android -dname "CN=NuvioTorrent Debug,O=NuvioTorrent,C=CH" -keyalg RSA -keysize 2048 -validity 10000
+          {
+            echo "NUVIO_RELEASE_STORE_FILE=$RUNNER_TEMP/ci-debug.jks"
+            echo "NUVIO_RELEASE_KEY_ALIAS=androiddebugkey"
+            echo "NUVIO_RELEASE_KEY_PASSWORD=android"
+            echo "NUVIO_RELEASE_STORE_PASSWORD=android"
+          } >> "$GITHUB_ENV"
+      - name: Test and compile Android TV
+        if: matrix.platform == 'tv'
+        working-directory: work/tv
+        run: ./gradlew :app:testFullDebugUnitTest --tests '*TorrentMetadataTest*' --tests '*TorrentSourceStreamTest*' --tests '*TorrentMagnetTest*' --tests '*PluginBinaryFetchTest*' :app:assembleFullDebug --stacktrace
+      - name: Test and compile Android mobile
+        if: matrix.platform == 'mobile'
+        working-directory: work/mobile
+        run: ./gradlew :composeApp:testAndroidHostTest --tests '*TorrentMetadataTest*' --tests '*TorrentSourceStreamTest*' --tests '*StreamParserTest*' --tests '*P2pStreamingEngineAndroidTest*' :androidApp:assembleFullDebug -Pnuvio.android.distribution=full -Pnuvio.ios.distribution=appstore --stacktrace
+      - name: Upload debug APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: NuvioTorrent-${{ matrix.platform }}-debug
+          path: |
+            work/${{ matrix.platform }}/app/build/outputs/apk/full/debug/*.apk
+            work/${{ matrix.platform }}/androidApp/build/outputs/apk/full/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+      - name: Enable emulator acceleration
+        if: github.event_name == 'workflow_dispatch' && inputs.native_smoke
+        run: |
+          # sudo permet uniquement l'accès de l'émulateur au périphérique KVM du runner GitHub.
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Verify real Android torrent metadata import
+        if: github.event_name == 'workflow_dispatch' && inputs.native_smoke
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          working-directory: work/${{ matrix.platform }}
+          disable-animations: true
+          script: |
+            if [ '${{ matrix.platform }}' = tv ]; then
+              ./gradlew :app:connectedFullDebugAndroidTest -Pdebuggable=true -Pandroid.testInstrumentationRunnerArguments.class=com.nuvio.tv.core.torrent.TorrentMetadataNativeTest --stacktrace
+            else
+              ./gradlew :androidApp:connectedFullDebugAndroidTest -Pnuvio.android.distribution=full -Pnuvio.ios.distribution=appstore -Pandroid.testInstrumentationRunnerArguments.class=com.nuvio.android.TorrentMetadataNativeTest --stacktrace
+            fi
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tests-${{ matrix.platform }}
+          path: |
+            work/${{ matrix.platform }}/app/build/reports/tests/
+            work/${{ matrix.platform }}/composeApp/build/reports/tests/
+          if-no-files-found: ignore
