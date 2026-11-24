@@ -1,3 +1,28 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 4953798..4227205 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -305,12 +305,18 @@ android {
+         }
+     }
+ 
++    // Keep the default multi-ABI build for emulator tests and upstream use.
++    val supportedApkAbis = listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
++    val requestedApkAbi = providers.gradleProperty("nuvio.tv.abi").orNull
++    require(requestedApkAbi == null || requestedApkAbi in supportedApkAbis) {
++        "Unsupported nuvio.tv.abi: $requestedApkAbi"
++    }
+     splits {
+         abi {
+             isEnable = !buildingAppBundle
+             reset()
+-            include("armeabi-v7a", "arm64-v8a", "x86", "x86_64")
+-            isUniversalApk = true
++            include(*(requestedApkAbi?.let { listOf(it) } ?: supportedApkAbis).toTypedArray())
++            isUniversalApk = requestedApkAbi == null
+         }
+     }
+ 
 diff --git a/app/src/full/java/com/nuvio/tv/core/plugin/PluginRuntime.kt b/app/src/full/java/com/nuvio/tv/core/plugin/PluginRuntime.kt
 index 7c9c204..47c54f6 100644
 --- a/app/src/full/java/com/nuvio/tv/core/plugin/PluginRuntime.kt

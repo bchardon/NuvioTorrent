@@ -9,7 +9,7 @@ Le dépôt contient des correctifs appliqués à des versions précises des appl
 - Les tests JavaScript de TR4KERIO et des deux contrats de résolution ont été exécutés localement.
 - Les correctifs sont vérifiés sur les commits de `upstreams.json`.
 - La compilation Android et les tests Kotlin doivent passer dans GitHub Actions avant installation.
-- Un test JNI sur émulateur est disponible ; une lecture réelle avec C411 reste à vérifier sur appareil.
+- Un test JNI sur émulateur est disponible ; une lecture réelle avec TR4KER reste à vérifier sur appareil.
 - Aucune PR n'est soumise aux projets officiels. Leur processus d'approbation des nouvelles fonctionnalités reste distinct de ce prototype.
 
 ## Compiler avec GitHub Actions
@@ -23,7 +23,7 @@ Il exécute les tests puis produit deux artefacts :
 
 Cocher **native_smoke** lors d'un lancement manuel pour vérifier aussi l'import d'un torrent privé synthétique par la véritable bibliothèque Android JNI. Le runner utilise `sudo` uniquement pour donner à l'émulateur accès au périphérique KVM du runner GitHub.
 
-Les secrets facultatifs `NUVIO_TV_LOCAL_PROPERTIES_BASE64` et `NUVIO_MOBILE_LOCAL_PROPERTIES_BASE64` fournissent les configurations d'exécution propres aux applications, notamment `TMDB_API_KEY`. Une compilation sans configuration ne fournit pas les clés privées des applications officielles. Ne pas placer de clé C411 dans ces fichiers : elle appartient à la configuration de TR4KERIO.
+Les secrets facultatifs `NUVIO_TV_LOCAL_PROPERTIES_BASE64` et `NUVIO_MOBILE_LOCAL_PROPERTIES_BASE64` fournissent les configurations d'exécution propres aux applications, notamment `TMDB_API_KEY`. Une compilation sans configuration ne fournit pas les clés privées des applications officielles. Ne pas placer de clé TR4KER dans ces fichiers : elle appartient à la configuration de TR4KERIO.
 
 Ces builds utilisent des signatures de développement. La signature TV générée peut changer entre exécutions ; ne pas compter sur une mise à jour transparente d'une installation existante signée autrement. Les APK ne constituent pas des versions officielles Nuvio.
 
@@ -112,3 +112,8 @@ python3 scripts/export-patches.py
 ```
 
 Lors d'une mise à jour des versions officielles, revoir les correctifs avant de changer `upstreams.json` et les commits du workflow. Les licences des projets officiels continuent de s'appliquer aux applications et au code modifié.
+
+La compilation TV de GitHub Actions produit uniquement l’APK `armeabi-v7a`
+pour la Xiaomi : `-Pnuvio.tv.abi=armeabi-v7a` désactive les autres APK et
+l’APK universel. La compilation mobile reste inchangée. Le test JNI facultatif
+sur émulateur conserve les architectures par défaut, dont `x86_64`.

@@ -91,7 +91,7 @@ jobs:
       - name: Test and compile Android TV
         if: matrix.platform == 'tv'
         working-directory: work/tv
-        run: ./gradlew :app:testFullDebugUnitTest --tests '*TorrentMetadataTest*' --tests '*TorrentSourceStreamTest*' --tests '*TorrentMagnetTest*' --tests '*PluginBinaryFetchTest*' :app:assembleFullDebug --stacktrace
+        run: ./gradlew :app:testFullDebugUnitTest --tests '*TorrentMetadataTest*' --tests '*TorrentSourceStreamTest*' --tests '*TorrentMagnetTest*' --tests '*PluginBinaryFetchTest*' :app:assembleFullDebug -Pnuvio.tv.abi=armeabi-v7a --stacktrace
       - name: Test and compile Android mobile
         if: matrix.platform == 'mobile'
         working-directory: work/mobile
