@@ -36,21 +36,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - platform: tv
-            repository: NuvioMedia/NuvioTV
-            commit: 77cc0bb5f42f55c5e3877fc4d57a7df510c3f42b
-          - platform: mobile
-            repository: NuvioMedia/NuvioMobile
-            commit: 0d20af832d381e5ab3a385deccfbc47c12b93bf1
+        platform: [tv, mobile]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ matrix.repository }}
-          ref: ${{ matrix.commit }}
-          path: work/${{ matrix.platform }}
-          persist-credentials: false
+      # Upstream gitlinks have incomplete .gitmodules entries. actions/checkout's
+      # authentication cleanup traverses them even with submodules disabled.
+      # A normal non-recursive clone avoids that traversal; Android uses the AARs.
+      - name: Prepare pinned upstream sources and apply patches
+        run: python3 scripts/prepare.py '${{ matrix.platform }}' --destination 'work/${{ matrix.platform }}'
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -60,8 +53,6 @@ jobs:
           node-version: '22'
       - uses: gradle/actions/setup-gradle@v4
       - uses: android-actions/setup-android@v3
-      - name: Apply pinned source patches
-        run: python3 scripts/prepare.py '${{ matrix.platform }}' --destination 'work/${{ matrix.platform }}'
       - name: Test JavaScript resolver contract
         run: node scripts/test-contract.js '${{ matrix.platform }}' 'work/${{ matrix.platform }}'
       - name: Prepare runtime properties
