@@ -2,7 +2,7 @@
 
 Implémentation expérimentale du ticket [NuvioTV #4002](https://github.com/NuvioMedia/NuvioTV/issues/4002), pour Android TV et Android mobile, avec adaptation de TR4KERIO.
 
-Le dépôt contient des correctifs appliqués à des versions précises des applications officielles, un addon TR4KERIO prêt à être testé et un workflow GitHub Actions. Les applications complètes sont récupérées pendant la compilation : inutile de dupliquer leurs bibliothèques et leurs historiques dans ce dépôt.
+Le dépôt contient des correctifs appliqués à des versions précises des applications officielles et un workflow GitHub Actions. L'addon TR4KERIO est maintenu séparément. Les applications complètes sont récupérées pendant la compilation : inutile de dupliquer leurs bibliothèques et leurs historiques dans ce dépôt.
 
 ## État de validation
 
@@ -29,10 +29,10 @@ Ces builds utilisent des signatures de développement. La signature TV généré
 
 ## Tester avec TR4KERIO
 
-Utiliser la copie `tr4kerio/` de ce dépôt. Le dossier d'origine de l'utilisateur n'est pas modifié.
+Utiliser le projet TR4KERIO maintenu séparément, situé dans `/home/bastien/Documents/developpement/nuvio/tr4kerio/` sur ce poste. Ce dépôt ne contient plus de copie de l'addon ; ses tests sont à exécuter depuis ce projet séparé. Le workflow GitHub Actions de NuvioTorrent conserve les tests des contrats de résolution et les builds Android.
 
 ```bash
-cd tr4kerio
+cd /home/bastien/Documents/developpement/nuvio/tr4kerio/
 npm install
 npm test
 npm start

@@ -19,16 +19,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  addon:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: Test lazy native sources and legacy compatibility
-        run: npm test --prefix tr4kerio
-
   android:
     name: Build and test ${{ matrix.platform }}
     runs-on: ubuntu-latest
